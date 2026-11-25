@@ -1,0 +1,809 @@
+name: NxNative - Generic IPA Builder
+
+on:
+  workflow_dispatch:
+    inputs:
+      device:
+        description: "Choose the target device and texture support path"
+        required: true
+        type: choice
+        default: "iPhone 15 or older (BC fallback)"
+        options:
+          - "iPhone 15 or older (BC fallback)"
+          - "iPhone 15 Pro/Pro Max or newer (standard)"
+      profile_id:
+        description: "Optional nxnative profile ID override (leave blank for automatic detection)"
+        required: false
+        type: string
+        default: ""
+      separate_game_files:
+        description: "Keep the game files out of the IPA (for large games). They are uploaded as a separate RomFS.img to copy into the app's folder."
+        required: false
+        type: boolean
+        default: false
+      preflight_only:
+        description: "Only run the checks and disk clean-up, then stop: no downloads, no build (to see free disk space first)"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # FIX: nxnative needs Xcode 27.2 (its Metal compiler is locked in dmsh_chain.lock).
+    # macos-latest has Xcode 26, which fails the MetalFX compile and the Metal check.
+    runs-on: xcode-27
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout BC fallback version
+        if: inputs.device == 'iPhone 15 or older (BC fallback)'
+        uses: actions/checkout@v4
+        with:
+          repository: mianmuhammadse/nxnative
+          # no-bc head of 2026-11-25: Digimon Story Time Stranger's profile, and upstream's
+          # thread scheduling fixes (yield/spin settings set once at start instead of racing,
+          # PR #2031; SetThreadActivity rules, #1855; stalled acquire threads, PR #3285).
+          # Pinned, so a later change to the fork can't alter a build without you knowing.
+          ref: 02145ddc51e65e329747856af54e10d8b40f36c5
+
+      - name: Checkout standard nxnative version
+        if: inputs.device == 'iPhone 15 Pro/Pro Max or newer (standard)'
+        uses: actions/checkout@v4
+        with:
+          repository: seedds/nxnative
+          ref: main
+
+      - name: Show nxnative version
+        shell: bash
+        run: |
+          git log -1 --format='nxnative %h, %cd: %s'
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Set up .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          # FIX: glslang is required by the build script's prerequisite check.
+          brew install xcodegen zstd unar glslang rclone
+          python -m pip install --upgrade pip
+          # FIX: zbic is required; capstone must be 5.x (the rewriter does not support 6).
+          python -m pip install \
+            lz4 "capstone>=5,<6" fonttools zbic nsz backports.zstd gdown
+
+      # FIX: everything the build needs is checked here, BEFORE any Google Drive
+      # download, so a toolchain problem costs no download quota.
+      - name: Preflight (no downloads)
+        shell: bash
+        env:
+          PREFLIGHT_ONLY: ${{ inputs.preflight_only }}
+        run: |
+          set -euo pipefail
+
+          XC="$(ls -d /Applications/Xcode_27.2*.app /Applications/Xcode-27.2*.app 2>/dev/null | sort -V | tail -n1 || true)"
+          if [[ -z "$XC" ]]; then
+            echo "::error::Xcode 27.2 not found on this runner. Installed Xcodes:"
+            ls -d /Applications/Xcode*.app || true
+            exit 1
+          fi
+          echo "Selecting $XC"
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
+
+          # Xcode 26 and later install the Metal compiler as a separate component.
+          if ! xcrun -sdk iphoneos metal --version >/dev/null 2>&1; then
+            echo "Metal toolchain missing; downloading it."
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+          echo "macOS Metal: $(xcrun -sdk macosx metal --version | head -n1)"
+          echo "iOS Metal:   $(xcrun -sdk iphoneos metal --version | head -n1)"
+
+          # The same Metal compiler check the build runs before its shader steps.
+          if ! python dm/gfx/tools/own_compilers.py --check-metal; then
+            echo "::error::The runner's Metal compiler is not the one nxnative's dmsh_chain.lock was tested with (see above)."
+            exit 1
+          fi
+
+          # The build script's own prerequisite check (modules, tools, iOS SDK,
+          # Metal compiler, shader translator, spirv-cross).
+          python - <<'PY'
+          import importlib.util, sys
+          from pathlib import Path
+          repo = Path.cwd()
+          spec = importlib.util.spec_from_file_location("build_ipa", repo / "scripts/build_ipa_from_nsp.py")
+          b = importlib.util.module_from_spec(spec); sys.modules["build_ipa"] = b; spec.loader.exec_module(b)
+          b.check_native_python()
+          env = b.tool_env(); env.setdefault("USER", "runner")
+          try:
+              b.check_prereqs(env, repo / "dm/gfx/tools/dmsh_xlate_bin/dmsh_xlate", False)
+          except b.BuildError as e:
+              print(f"::error::nxnative prerequisite check failed: {e}"); sys.exit(1)
+          print("nxnative prerequisites: OK")
+          PY
+
+          # FIX: Triangle Strategy ran out of disk while packing its 10.9 GB IPA (35 GB free
+          # at the start was not enough). Remove what the runner image carries that this
+          # build never uses: other Xcode versions, iOS simulator runtimes, the Android SDK.
+          echo "Disk space before clean-up:"; df -h "$RUNNER_TEMP"
+          SELECTED="$(cd "$XC" && pwd -P)"
+          for app in /Applications/Xcode*.app; do
+            [[ -L "$app" ]] && continue                          # leave symlinks alone
+            [[ "$(cd "$app" && pwd -P)" == "$SELECTED" ]] && continue
+            echo "Removing unused $app"
+            sudo rm -rf "$app" || true
+          done
+          xcrun simctl runtime delete all >/dev/null 2>&1 || true
+          sudo rm -rf /Library/Developer/CoreSimulator/Profiles/Runtimes/* || true
+          for d in "${ANDROID_HOME:-}" "${ANDROID_SDK_ROOT:-}" "$HOME/Library/Android/sdk"; do
+            [[ -n "$d" && -d "$d" ]] && { echo "Removing $d"; sudo rm -rf "$d" || true; }
+          done
+          # The selected Xcode must still work after the clean-up.
+          xcodebuild -version >/dev/null
+          xcrun -sdk iphoneos --show-sdk-path >/dev/null
+
+          echo "Disk space after clean-up:"; df -h "$RUNNER_TEMP"
+          FREE_GB="$(df -g "$RUNNER_TEMP" | awk 'NR==2 {print $4}')"
+          # Peak need: the downloads, then the packages, the extracted game, shaders and
+          # the IPA being packed. Large games (8 GB+ of packages) should use
+          # separate_game_files, which leaves the game files out of the IPA.
+          if (( FREE_GB < 45 )); then
+            echo "::warning::Only ${FREE_GB} GB free. Large games may run out of disk space; tick separate_game_files for games over about 6 GB."
+          fi
+
+          if [[ "$PREFLIGHT_ONLY" == "true" ]]; then
+            echo "::notice::Preflight only: ${FREE_GB} GB free after clean-up. Nothing was downloaded or built."
+          fi
+
+      # Large outputs go to your own Google Drive instead of GitHub artifacts (a private
+      # repo's artifact storage is 0.5–2 GB). Uses rclone signed in as you: the secret
+      # RCLONE_DRIVE_TOKEN holds the token that "rclone authorize drive" prints.
+      # Checked here, before any download, so a bad token or a full Drive costs nothing.
+      - name: Check Google Drive access (no downloads)
+        id: drivecheck
+        shell: bash
+        env:
+          RCLONE_CONFIG_GDRIVE_TYPE: drive
+          RCLONE_CONFIG_GDRIVE_SCOPE: drive
+          RCLONE_CONFIG_GDRIVE_TOKEN: ${{ secrets.RCLONE_DRIVE_TOKEN }}
+          SEPARATE: ${{ inputs.separate_game_files }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${RCLONE_CONFIG_GDRIVE_TOKEN:-}" ]]; then
+            echo "No RCLONE_DRIVE_TOKEN secret: outputs go to GitHub artifacts as before."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # rclone's notices (such as "Config file not found") go to stderr, kept apart from
+          # the JSON answer on stdout.
+          ERR="$RUNNER_TEMP/rclone_about.err"
+          if ! ABOUT="$(rclone about gdrive: --json 2>"$ERR")"; then
+            tail -n 5 "$ERR"
+            echo "::error::rclone could not sign in to Google Drive with RCLONE_DRIVE_TOKEN. Make a new token with the \"Google Drive sign-in\" workflow."
+            exit 1
+          fi
+          FREE_GB="$(echo "$ABOUT" | python -c '
+          import json, sys
+          text = sys.stdin.read()
+          start = text.find("{")
+          try:
+              d = json.loads(text[start:]) if start >= 0 else {}
+          except ValueError:
+              d = {}
+          f = d.get("free")
+          print(-1 if f is None else f // 10**9)
+          ')"
+          if [[ "$FREE_GB" == "-1" ]]; then
+            echo "Google Drive: signed in (free space not reported)."
+          else
+            echo "Google Drive: signed in, ${FREE_GB} GB free."
+            NEED_GB=1
+            [[ "$SEPARATE" == "true" ]] && NEED_GB=10
+            if (( FREE_GB < NEED_GB )); then
+              echo "::error::Google Drive has ${FREE_GB} GB free; this build's files need about ${NEED_GB} GB. Free up space (for example, delete the game's RARs) and re-run."
+              exit 1
+            fi
+          fi
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+
+      - name: Download game files and keys
+        if: ${{ !inputs.preflight_only }}
+        env:
+          GAME_URL: ${{ secrets.Game_URL }}
+          # Optional: parts 2 and 3 of a base game split into a multi-part RAR (Game_URL is part 1).
+          GAME_URL_2: ${{ secrets.Game_URL_2 }}
+          GAME_URL_3: ${{ secrets.Game_URL_3 }}
+          UPDATE_URL: ${{ secrets.Update_URL }}
+          # Optional: parts 2 and 3 of an update split into a multi-part RAR (Update_URL is part 1).
+          UPDATE_URL_2: ${{ secrets.Update_URL_2 }}
+          UPDATE_URL_3: ${{ secrets.Update_URL_3 }}
+          DLC_URL: ${{ secrets.DLC_URL }}
+          KEYS_URL: ${{ secrets.Keys_URL }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/nxnative"
+          mkdir -p "$WORK"
+
+          download_file() {
+            local url="$1"
+            local output="$2"
+            local file_id
+
+            if [[ -z "${url:-}" ]]; then
+              echo "::error::A required download URL is empty."
+              exit 1
+            fi
+
+            file_id="$(python - "$url" <<'PY'
+          import re
+          import sys
+          from urllib.parse import urlparse, parse_qs
+
+          url = sys.argv[1].strip()
+          parsed = urlparse(url)
+          query = parse_qs(parsed.query)
+          file_id = None
+
+          if parsed.netloc.lower() in (
+              "drive.google.com",
+              "www.drive.google.com",
+          ):
+              match = re.search(r"/file/d/([^/]+)", parsed.path)
+              if match:
+                  file_id = match.group(1)
+              elif query.get("id"):
+                  file_id = query["id"][0]
+
+          if not file_id and re.fullmatch(
+              r"[-A-Za-z0-9_]{20,}", url
+          ):
+              file_id = url
+
+          if not file_id:
+              raise SystemExit(
+                  "Could not extract a Google Drive file ID."
+              )
+
+          print(file_id)
+          PY
+          )"
+
+            echo "Downloading $(basename "$output")..."
+            gdown "$file_id" -O "$output"
+
+            if [[ ! -s "$output" ]]; then
+              echo "::error::Downloaded file is empty."
+              exit 1
+            fi
+
+            file "$output"
+          }
+
+          # Keys first: the smallest file, so a bad link fails before the big download.
+          download_file "$KEYS_URL" "$WORK/prod.keys"
+
+          # One file, or a RAR split into up to 3 parts. The parts go side by side as
+          # <label>.part1.rar, .part2.rar, .part3.rar, so unar reads them all from part 1.
+          download_package() {
+            local label="$1" name="$2" url1="${3:-}" url2="${4:-}" url3="${5:-}"
+            if [[ -z "$url2" && -z "$url3" ]]; then
+              if [[ -n "$url1" ]]; then
+                download_file "$url1" "$WORK/$label.download"
+                return 0
+              fi
+              return 1
+            fi
+            if [[ -z "$url1" ]]; then
+              echo "::error::${name}_URL_2 or _3 is set but ${name}_URL (part 1) is empty."
+              exit 1
+            fi
+            if [[ -n "$url3" && -z "$url2" ]]; then
+              echo "::error::${name}_URL_3 is set but ${name}_URL_2 (part 2) is empty."
+              exit 1
+            fi
+            local parts=("$url1" "$url2")
+            [[ -n "$url3" ]] && parts+=("$url3")
+            echo "$name: ${#parts[@]}-part RAR"
+            local i=1
+            for u in "${parts[@]}"; do
+              download_file "$u" "$WORK/$label.part$i.rar"
+              i=$(( i + 1 ))
+            done
+          }
+
+          if ! download_package game Game "${GAME_URL:-}" "${GAME_URL_2:-}" "${GAME_URL_3:-}"; then
+            echo "::error::Game_URL is empty."
+            exit 1
+          fi
+
+          if ! download_package update Update "${UPDATE_URL:-}" "${UPDATE_URL_2:-}" "${UPDATE_URL_3:-}"; then
+            echo "No UPDATE_URL configured; continuing without an update."
+          fi
+
+          if [[ -n "${DLC_URL:-}" ]]; then
+            download_file "$DLC_URL" "$WORK/dlc.download"
+          else
+            echo "No DLC_URL configured; continuing without DLC."
+          fi
+
+          chmod 600 "$WORK/prod.keys"
+          df -h "$RUNNER_TEMP"
+
+      - name: Extract RAR archives or accept direct game packages
+        if: ${{ !inputs.preflight_only }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/nxnative"
+          GAME_DIR="$RUNNER_TEMP/GameFiles"
+          mkdir -p "$GAME_DIR"
+
+          python - "$WORK" "$GAME_DIR" <<'PY'
+          import shutil
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          work = Path(sys.argv[1])
+          game_dir = Path(sys.argv[2])
+          package_extensions = {
+              ".nsp", ".xci", ".nsz", ".xcz"
+          }
+          rar_signatures = (
+              b"Rar!\x1a\x07\x00",
+              b"Rar!\x1a\x07\x01\x00",
+          )
+
+          # FIX: a full XCI starts with a 0x100-byte signature and has "HEAD" at
+          # 0x100 (as nxnative's own reader checks); a trimmed one may have it at 0.
+          def is_xci(path):
+              with path.open("rb") as f:
+                  magic_0 = f.read(4)
+                  f.seek(0x100)
+                  magic_100 = f.read(4)
+              return magic_0 == b"HEAD" or magic_100 == b"HEAD"
+
+          def validate_package(path):
+              with path.open("rb") as f:
+                  magic = f.read(4)
+
+              suffix = path.suffix.lower()
+
+              if suffix in (".nsp", ".nsz") and magic != b"PFS0":
+                  raise SystemExit(
+                      f"Invalid {suffix} package signature: {path.name}"
+                  )
+
+              if suffix in (".xci", ".xcz") and not is_xci(path):
+                  raise SystemExit(
+                      f"Invalid {suffix} package signature: {path.name}"
+                  )
+
+          # FIX: move instead of copy, so the packages are not on disk twice.
+          def add_package(source, label):
+              target = game_dir / source.name
+
+              if target.exists():
+                  raise SystemExit(
+                      "Duplicate package filename: " + source.name
+                  )
+
+              validate_package(source)
+              shutil.move(str(source), str(target))
+
+              print(
+                  f"Added {label}: {target.name} "
+                  f"({target.stat().st_size:,} bytes)"
+              )
+
+          def process_download(label):
+              source = work / f"{label}.download"
+              volumes = sorted(work.glob(f"{label}.part*.rar"))
+
+              if volumes:
+                  # A multi-part RAR: unar is given part 1 and reads the rest itself.
+                  source = work / f"{label}.part1.rar"
+                  for volume in volumes:
+                      with volume.open("rb") as f:
+                          head = f.read(8)
+                          if not any(head.startswith(m) for m in rar_signatures):
+                              raise SystemExit(
+                                  f"{volume.name} is not a RAR volume. "
+                                  "Check the Drive links for both parts."
+                              )
+                  print(f"{label}: {len(volumes)}-part RAR archive: "
+                        + ", ".join(f"{v.name} ({v.stat().st_size:,} bytes)" for v in volumes))
+
+              if not source.exists():
+                  print(f"No {label} download; skipping.")
+                  return
+
+              with source.open("rb") as f:
+                  signature = f.read(8)
+
+              is_rar = any(
+                  signature.startswith(magic)
+                  for magic in rar_signatures
+              )
+
+              if is_rar:
+                  extract_dir = work / f"extracted-{label}"
+                  extract_dir.mkdir(parents=True, exist_ok=True)
+
+                  print(f"{label}: RAR archive detected; extracting.")
+
+                  result = subprocess.run(
+                      [
+                          "unar",
+                          "-o",
+                          str(extract_dir),
+                          str(source),
+                      ],
+                  )
+                  if result.returncode != 0:
+                      hint = (" If this is a two-part RAR, check that Game_URL is part 1 "
+                              "and Game_URL_2 is part 2, and that both downloaded completely."
+                              if volumes else "")
+                      raise SystemExit(f"unar could not extract the {label} archive.{hint}")
+
+                  # FIX: free the archive's space as soon as it is extracted.
+                  source.unlink(missing_ok=True)
+                  for volume in volumes:
+                      volume.unlink(missing_ok=True)
+
+                  packages = sorted(
+                      p for p in extract_dir.rglob("*")
+                      if p.is_file()
+                      and p.suffix.lower() in package_extensions
+                  )
+
+                  if not packages:
+                      raise SystemExit(
+                          f"No NSP/XCI/NSZ/XCZ packages found "
+                          f"in the {label} RAR archive."
+                      )
+
+                  for package in packages:
+                      add_package(package, label)
+
+                  shutil.rmtree(extract_dir, ignore_errors=True)
+
+              else:
+                  print(
+                      f"{label}: not a RAR archive; "
+                      "checking as a direct package."
+                  )
+
+                  if signature[:4] == b"PFS0":
+                      extension = ".nsp"
+                  elif is_xci(source):
+                      extension = ".xci"
+                  else:
+                      raise SystemExit(
+                          f"{label} is not a recognized RAR archive "
+                          "or direct NSP/XCI package. "
+                          "Direct downloads must be NSP or XCI files."
+                      )
+
+                  target = game_dir / f"{label}{extension}"
+
+                  if target.exists():
+                      raise SystemExit(
+                          f"Output package already exists: {target.name}"
+                      )
+
+                  shutil.move(str(source), str(target))
+                  validate_package(target)
+
+                  print(
+                      f"Added direct package: {target.name} "
+                      f"({target.stat().st_size:,} bytes)"
+                  )
+
+          process_download("game")
+          process_download("update")
+          process_download("dlc")
+
+          packages = sorted(
+              p for p in game_dir.iterdir()
+              if p.is_file()
+              and p.suffix.lower() in package_extensions
+          )
+
+          if not packages:
+              raise SystemExit("No game packages were prepared.")
+
+          print("\n=== Prepared game packages ===")
+          for package in packages:
+              print(f"{package.name}: {package.stat().st_size:,} bytes")
+          PY
+
+          rm -rf "$WORK"/*.download "$WORK"/*.part*.rar "$WORK"/extracted-*
+          test -s "$WORK/prod.keys"
+          df -h "$RUNNER_TEMP"
+
+      - name: Detect game title ID and select shader profile
+        if: ${{ !inputs.preflight_only }}
+        env:
+          PROFILE_OVERRIDE: ${{ inputs.profile_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          GAME_DIR="$RUNNER_TEMP/GameFiles"
+
+          DETECTED_ID="$(python - "$GAME_DIR" <<'PY'
+          import re
+          import struct
+          import sys
+          from pathlib import Path
+
+          root = Path(sys.argv[1])
+          extensions = {".nsp", ".xci", ".nsz", ".xcz"}
+
+          def pfs0_names(path):
+              try:
+                  with path.open("rb") as f:
+                      header = f.read(16)
+
+                      if len(header) != 16 or header[:4] != b"PFS0":
+                          return []
+
+                      count, string_size = struct.unpack_from(
+                          "<II", header, 4
+                      )
+
+                      if count > 100000 or string_size > 100000000:
+                          return []
+
+                      entries = f.read(count * 0x18)
+                      strings = f.read(string_size)
+
+                      if len(entries) != count * 0x18:
+                          return []
+
+                      names = []
+
+                      for i in range(count):
+                          offset = struct.unpack_from(
+                              "<I", entries, i * 0x18 + 0x10
+                          )[0]
+
+                          if offset >= len(strings):
+                              continue
+
+                          end = strings.find(b"\0", offset)
+
+                          if end < 0:
+                              continue
+
+                          names.append(
+                              strings[offset:end].decode(
+                                  errors="replace"
+                              )
+                          )
+
+                      return names
+
+              except (OSError, struct.error):
+                  return []
+
+          candidates = set()
+
+          for path in root.iterdir():
+              if not path.is_file() or path.suffix.lower() not in extensions:
+                  continue
+
+              for name in pfs0_names(path):
+                  match = re.fullmatch(
+                      r"([0-9A-Fa-f]{16})[0-9A-Fa-f]{16}\.tik",
+                      name,
+                  )
+
+                  if match:
+                      title_id = int(match.group(1), 16)
+
+                      if (title_id & 0xFFF) == 0:
+                          candidates.add(f"{title_id:016X}")
+
+              match = re.search(
+                  r"\[([0-9A-Fa-f]{16})\]",
+                  path.name,
+              )
+
+              if match:
+                  title_id = int(match.group(1), 16)
+
+                  if (title_id & 0xFFF) == 0:
+                      candidates.add(f"{title_id:016X}")
+
+          if len(candidates) != 1:
+              raise SystemExit(
+                  "Could not uniquely identify the base game's title ID. "
+                  f"Candidates found: {sorted(candidates)}. "
+                  "Check the base NSP and its ticket/filename."
+              )
+
+          print(next(iter(candidates)))
+          PY
+          )"
+
+          PROFILE_ID="${PROFILE_OVERRIDE:-$DETECTED_ID}"
+          PROFILE_ID="$(echo "$PROFILE_ID" | tr '[:lower:]' '[:upper:]')"
+
+          if [[ ! "$PROFILE_ID" =~ ^[0-9A-F]{16}$ ]]; then
+            echo "::error::Profile ID must be exactly 16 hexadecimal characters."
+            exit 1
+          fi
+
+          echo "Detected base title ID: $DETECTED_ID"
+          echo "Shader profile ID: $PROFILE_ID"
+          echo "DM_GAME=$PROFILE_ID" >> "$GITHUB_ENV"
+          echo "DETECTED_TITLE_ID=$DETECTED_ID" >> "$GITHUB_ENV"
+
+      - name: Game profile and game-specific defaults
+        if: ${{ !inputs.preflight_only }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PROFILE="dm/games/$DM_GAME/game.tsv"
+          if [[ ! -f "$PROFILE" ]]; then
+            echo "::warning::This nxnative version has no profile for $DM_GAME: the build makes a provisional one, which may not start. A newer nxnative version may have it."
+            exit 0
+          fi
+          # FIX: awk, not "grep -P" — the macOS runner's BSD grep has no -P and exits 2.
+          echo "Profile: $(awk -F'\t' '$1=="name"{print $2; exit}' "$PROFILE") ($PROFILE)"
+          awk -F'\t' '$1=="build"{print "  registered build: " $2 " (" $3 ")"}' "$PROFILE"
+
+          case "$DM_GAME" in
+            010062E01FE0C000)
+              # Digimon Story Time Stranger: an iPhone freeze after 4–9 minutes in PoseWorker
+              # (seedds/nxnative issue #872) was avoided with DM_PREEMPT=1, which is this key.
+              # DM_PREEMPT=0 in the app's Documents/env.txt turns it off again.
+              if ! awk -F'\t' '$1=="core_preempt"{f=1} END{exit !f}' "$PROFILE"; then
+                printf 'core_preempt\ton\n' >> "$PROFILE"
+              fi
+              echo "Digimon Story Time Stranger: core_preempt on (iPhone freeze workaround)"
+              ;;
+          esac
+
+      # FIX: "dmsh_chain.py --update-lock" is not a valid option (it exits 1), and
+      # "--header" rewrites a committed file the build already ships correct.
+      # This step now only prints the shader chain version for the log.
+      - name: Show shader toolchain version
+        if: ${{ !inputs.preflight_only }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Shader profile: $DM_GAME"
+          echo "Shader chain version: $(python dm/gfx/tools/dmsh_chain.py)"
+
+      - name: Build unsigned IPA
+        if: ${{ !inputs.preflight_only }}
+        shell: bash
+        env:
+          PYTHONUNBUFFERED: "1"
+          SEPARATE: ${{ inputs.separate_game_files && '1' || '0' }}
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/nxnative"
+          GAME_DIR="$RUNNER_TEMP/GameFiles"
+          OUTPUT="$RUNNER_TEMP/NxNative.ipa"
+          BUILD_LOG="$RUNNER_TEMP/build_output.txt"
+
+          # Large games: leave the game files (RomFS) out of the IPA.
+          EXTRA_ARGS=()
+          if [[ "$SEPARATE" == "1" ]]; then
+            EXTRA_ARGS+=(--romfs separate)
+          fi
+
+          python scripts/build_ipa_from_nsp.py \
+            "$GAME_DIR" \
+            -k "$WORK/prod.keys" \
+            -o "$OUTPUT" \
+            --progress lines \
+            ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} 2>&1 | tee "$BUILD_LOG" || {
+              echo "=== First errors in the build logs ==="
+              grep -n -m 20 -E 'error:|\[RED\]' "$GAME_DIR"/*_build/logs/*.log 2>/dev/null || true
+              df -h "$RUNNER_TEMP"
+              exit 1
+            }
+
+          if [[ ! -s "$OUTPUT" ]]; then
+            echo "::error::IPA build did not produce an output file."
+            exit 1
+          fi
+
+          echo "IPA successfully created: $OUTPUT"
+          ls -lh "$OUTPUT"
+
+          if [[ "$SEPARATE" == "1" ]]; then
+            # The build prints: scripts/push_romfs.sh <device UDID> <bundle ID> "<path to RomFS.img>"
+            PUSH_LINE="$(grep 'push_romfs.sh' "$BUILD_LOG" | tail -n1 || true)"
+            IMAGE="$(echo "$PUSH_LINE" | sed -n 's/.*"\(.*\)".*/\1/p')"
+            if [[ -z "$IMAGE" || ! -f "$IMAGE" ]]; then
+              echo "::error::Could not find the RomFS image this build was made for. Build output line: $PUSH_LINE"
+              exit 1
+            fi
+            # The app only accepts the file under this exact name.
+            mkdir -p "$RUNNER_TEMP/romfs"
+            mv "$IMAGE" "$RUNNER_TEMP/romfs/romfs.img"
+            echo "Game files for the app's folder:"
+            ls -lh "$RUNNER_TEMP/romfs/romfs.img"
+            echo "Bundle ID: $(echo "$PUSH_LINE" | sed -n 's/.*<device UDID> \([^ ]*\) .*/\1/p')"
+          fi
+
+      - name: Upload to Google Drive
+        if: success() && !inputs.preflight_only && steps.drivecheck.outputs.enabled == 'true'
+        shell: bash
+        env:
+          RCLONE_CONFIG_GDRIVE_TYPE: drive
+          RCLONE_CONFIG_GDRIVE_SCOPE: drive
+          RCLONE_CONFIG_GDRIVE_TOKEN: ${{ secrets.RCLONE_DRIVE_TOKEN }}
+        run: |
+          set -euo pipefail
+          FOLDER="nxnative-builds/$(date -u +%Y%m%d)-run${GITHUB_RUN_NUMBER}-${DM_GAME:-game}"
+          FLAGS=(--drive-chunk-size 256M --transfers 2 --retries 5 --low-level-retries 20
+                 --stats 30s --stats-one-line --stats-log-level NOTICE)
+          echo "Uploading to Google Drive folder: $FOLDER"
+          rclone copyto "$RUNNER_TEMP/NxNative.ipa" "gdrive:$FOLDER/NxNative-${DM_GAME:-game}.ipa" "${FLAGS[@]}"
+          if [[ -f "$RUNNER_TEMP/romfs/romfs.img" ]]; then
+            rclone copyto "$RUNNER_TEMP/romfs/romfs.img" "gdrive:$FOLDER/romfs.img" "${FLAGS[@]}"
+          fi
+          for d in "$RUNNER_TEMP"/GameFiles/*_build/logs; do
+            [[ -d "$d" ]] && rclone copy "$d" "gdrive:$FOLDER/logs" "${FLAGS[@]}" || true
+          done
+          echo "In Google Drive → $FOLDER:"
+          rclone lsl "gdrive:$FOLDER" --max-depth 1
+          echo "::notice::Uploaded to Google Drive: $FOLDER"
+
+      - name: Upload IPA
+        if: success() && !inputs.preflight_only && steps.drivecheck.outputs.enabled != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: NxNative-IPA-${{ inputs.device == 'iPhone 15 or older (BC fallback)' && 'BC-Fallback' || 'Standard' }}
+          path: ${{ runner.temp }}/NxNative.ipa
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+      - name: Upload game files (romfs.img)
+        if: success() && inputs.separate_game_files && !inputs.preflight_only && steps.drivecheck.outputs.enabled != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: NxNative-GameFiles-romfs
+          path: ${{ runner.temp }}/romfs/romfs.img
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+      - name: Upload build logs if available
+        if: always()
+        # Small, but still refused when the artifact quota is used up: never fail the run for it.
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: NxNative-Build-Logs
+          path: |
+            ${{ runner.temp }}/GameFiles/*_build/logs/
+            ${{ runner.temp }}/GameFiles/*_survey/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Clean up downloaded files and keys
+        if: always()
+        shell: bash
+        run: |
+          rm -rf \
+            "$RUNNER_TEMP/nxnative" \
+            "$RUNNER_TEMP/GameFiles"
